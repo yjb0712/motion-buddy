@@ -133,7 +133,10 @@ export const decodeAudioBase64 = (base64: string, mime = 'audio/mpeg') => {
 }
 
 export const companionTurn = (state: AppState, sessionId: string, message: string, trainingState: TrainingState) => ({
-  sessionId, message, trainingState, memory: memoryPayload(state),
+  session_id: sessionId,
+  message,
+  training_state: trainingState,
+  memory: memoryPayload(state),
 })
 
 export async function streamCompanionTurn(

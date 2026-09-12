@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 
 const CHECK_INTERVAL_MS = 100
-const ABOVE_THRESHOLD_CHECKS = 3
+const ABOVE_THRESHOLD_CHECKS = 5
 const CALIBRATION_SAMPLES = 6
-const MIN_THRESHOLD = 0.02
+const MIN_THRESHOLD = 0.05
+const NOISE_FLOOR_FACTOR = 3.5
+const GRACE_MS = 800
 
 /**
  * 播放期的打断检测：单独开一路带回声消除的麦克风，
@@ -48,7 +50,10 @@ export function useBargeInDetector(onDetected: () => void) {
         let noiseFloor = 0
         let calibrationSamples = 0
         let aboveCount = 0
+        const startedAt = Date.now()
         timer = window.setInterval(() => {
+          // 播放起音阶段喇叭和 AEC 还没稳定，留出宽限期不打断
+          if (Date.now() - startedAt < GRACE_MS) return
           analyser.getFloatTimeDomainData(buffer)
           let sum = 0
           for (let index = 0; index < buffer.length; index += 1) sum += buffer[index] * buffer[index]
@@ -58,7 +63,7 @@ export function useBargeInDetector(onDetected: () => void) {
             calibrationSamples += 1
             return
           }
-          const threshold = Math.max(MIN_THRESHOLD, noiseFloor * 2.2)
+          const threshold = Math.max(MIN_THRESHOLD, noiseFloor * NOISE_FLOOR_FACTOR)
           aboveCount = rms > threshold ? aboveCount + 1 : 0
           if (aboveCount >= ABOVE_THRESHOLD_CHECKS) {
             cleanup()
