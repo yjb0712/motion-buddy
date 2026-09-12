@@ -192,13 +192,24 @@ def prepare_speech_text(text: str) -> str:
     return spoken[:500]
 
 
+def chat_payload(model: str, messages: list[dict], temperature: float = 0.5, stream: bool = False) -> dict:
+    payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": 140}
+    if model.lower().startswith("glm"):
+        payload["thinking"] = {"type": "disabled"}  # 智谱模型不关思考会把回答写进 reasoning_content，content 变空
+    else:
+        payload["enable_thinking"] = False
+    if stream:
+        payload["stream"] = True
+    return payload
+
+
 async def call_dashscope(model: str, messages: list[dict], temperature: float = 0.5) -> str:
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=8.0)) as client:
             response = await client.post(
                 CHAT_URL,
                 headers={"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "temperature": temperature, "max_tokens": 140, "enable_thinking": False},
+                json=chat_payload(model, messages, temperature),
             )
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="模型响应超时，请再说一次") from exc
@@ -215,7 +226,7 @@ def sse_event(event: str, data: dict) -> str:
 
 async def stream_chat_delta(model: str, messages: list[dict]):
     """逐段 yield 大模型流式回复的文本增量。"""
-    payload = {"model": model, "messages": messages, "temperature": 0.5, "max_tokens": 140, "enable_thinking": False, "stream": True}
+    payload = chat_payload(model, messages, stream=True)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=8.0)) as client:
             async with client.stream(
