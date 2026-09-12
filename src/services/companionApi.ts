@@ -10,6 +10,18 @@ export type TurnEvent =
 const apiBase = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const retryableStatus = new Set([429, 502, 503, 504])
 const wait = (milliseconds: number) => new Promise(resolve => window.setTimeout(resolve, milliseconds))
+
+export const detailMessage = (payload: unknown, fallback: string) => {
+  const detail = (payload as { detail?: unknown })?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map(item => (item as { msg?: string; loc?: unknown[] })?.msg?.split('Value error, ')[1] || (item as { msg?: string })?.msg)
+      .filter(Boolean)
+    if (messages.length) return `请求参数有问题（${messages.join('；')}）`
+  }
+  return fallback
+}
 const memoryPayload = (state: AppState) => state.memory.consent ? {
   preferred_address: state.memory.preferredAddress,
   encouragement_style: state.memory.encouragementStyle,
@@ -26,7 +38,7 @@ async function request(path: string, body: Record<string, unknown>): Promise<Api
       const response = await fetch(`${apiBase}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal })
       const payload = await response.json().catch(() => ({}))
       if (response.ok) return payload as ApiResponse
-      lastError = new Error(typeof payload.detail === 'string' ? payload.detail : '动伴暂时没有连上服务')
+      lastError = new Error(detailMessage(payload, '动伴暂时没有连上服务'))
       if (!retryableStatus.has(response.status) || attempt > 0) throw lastError
     } catch (error) {
       lastError = error instanceof DOMException && error.name === 'AbortError'
@@ -76,7 +88,7 @@ export async function fetchSummaryLine(state: AppState, sessionId: string, data:
       signal: controller.signal,
     })
     const payload = await response.json().catch(() => ({}))
-    if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : '总结语生成失败')
+    if (!response.ok) throw new Error(detailMessage(payload, '总结语生成失败'))
     return payload.line as string
   } finally {
     window.clearTimeout(timer)
@@ -98,7 +110,7 @@ export async function streamCompanionSpeech(text: string) {
       })
       if (response.ok) return response
       const payload = await response.json().catch(() => ({}))
-      lastError = new Error(typeof payload.detail === 'string' ? payload.detail : '语音输出暂时不可用')
+      lastError = new Error(detailMessage(payload, '语音输出暂时不可用'))
       if (!retryableStatus.has(response.status) || attempt > 0) throw lastError
     } catch (error) {
       lastError = error instanceof DOMException && error.name === 'AbortError'
@@ -146,7 +158,7 @@ export async function streamCompanionTurn(
     })
     if (!response.ok || !response.body) {
       const payload = await response.json().catch(() => ({}))
-      throw new Error(typeof payload.detail === 'string' ? payload.detail : '动伴暂时没有连上服务')
+      throw new Error(detailMessage(payload, '动伴暂时没有连上服务'))
     }
     const reader = response.body.getReader()
     const decoder = new TextDecoder()

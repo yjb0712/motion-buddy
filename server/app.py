@@ -10,7 +10,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 try:
     from dotenv import load_dotenv
@@ -71,12 +71,28 @@ class MemoryContext(BaseModel):
     favorite_exercise: str = Field(default="", max_length=50)
     last_user_feeling: str = Field(default="", max_length=30)
 
+    @field_validator("preferred_address", "favorite_exercise", "last_user_feeling", mode="before")
+    @classmethod
+    def _truncate_text(cls, value):
+        # 前端输入自由文本，超长截断而不是整条拒绝（422 会让用户以为服务挂了）
+        return str(value)[:30] if value else ""
+
+    @field_validator("encouragement_style", mode="before")
+    @classmethod
+    def _fallback_style(cls, value):
+        return value if value in ("quiet", "warm", "energetic") else "warm"
+
 
 class CompanionRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=100)
     message: str = Field(min_length=1, max_length=1000)
     training_state: Literal["preparing", "training", "paused", "finished"]
     memory: MemoryContext | None = None
+
+    @field_validator("session_id", "message", mode="before")
+    @classmethod
+    def _coerce_text(cls, value):
+        return str(value) if value is not None else ""
 
 
 class VisionRequest(CompanionRequest):
