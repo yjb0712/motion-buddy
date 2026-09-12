@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.docx-review/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+.test-dist/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.runtime/
