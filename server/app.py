@@ -1,12 +1,15 @@
 import asyncio
+import base64
+import json
 import os
 import re
+from collections import deque
 from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -27,6 +30,39 @@ TTS_INSTRUCTIONS = os.getenv(
 MODEL_API_BASE_URL = os.getenv("MODEL_API_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/")
 CHAT_URL = f"{MODEL_API_BASE_URL}/chat/completions"
 TTS_URL = f"{MODEL_API_BASE_URL}/audio/speech"
+
+HISTORY_TURNS_PER_SESSION = 3
+chat_history: dict[str, deque] = {}
+
+
+def history_messages(session_id: str) -> list[dict]:
+    return list(chat_history.get(session_id, ()))
+
+
+def remember_turn(session_id: str, message: str, reply: str) -> None:
+    history = chat_history.setdefault(session_id, deque(maxlen=HISTORY_TURNS_PER_SESSION * 2))
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": reply})
+
+
+SENTENCE_ENDINGS = "。！？!?；;"
+SENTENCE_TRAILERS = "”’\"')）"
+
+
+def cut_sentences(buffer: str) -> tuple[list[str], str]:
+    """按终止标点把缓冲切成完整句，返回 (完整句列表, 剩余缓冲)。"""
+    sentences: list[str] = []
+    start = 0
+    for index, char in enumerate(buffer):
+        if char in SENTENCE_ENDINGS:
+            end = index + 1
+            while end < len(buffer) and buffer[end] in SENTENCE_TRAILERS:
+                end += 1
+            sentence = buffer[start:end].strip()
+            if sentence:
+                sentences.append(sentence)
+            start = end
+    return sentences, buffer[start:]
 
 
 class MemoryContext(BaseModel):
@@ -57,6 +93,18 @@ class SpeechRequest(BaseModel):
     text: str = Field(min_length=1, max_length=500)
 
 
+class SummaryLineRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=100)
+    reps: int = Field(ge=0, le=10000)
+    duration_seconds: int = Field(ge=0, le=86400)
+    average_bpm: int | None = Field(default=None, ge=30, le=250)
+    calorie_kcal: float | None = Field(default=None, ge=0, le=5000)
+    xp_earned: int = Field(ge=0, le=100000)
+    streak_days: int = Field(ge=0, le=3650)
+    reward_track: Literal["rep_count", "heart_rate"] = "rep_count"
+    memory: MemoryContext | None = None
+
+
 app = FastAPI(title="Motion Buddy API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -66,11 +114,22 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
+from server.asr_proxy import asr_proxy  # noqa: E402  密钥留在服务端的流式识别代理
+
+app.add_api_websocket_route("/ws/asr", asr_proxy)
+
+
+STYLE_LINES = {
+    "quiet": "话少，常常一两个字就够，不主动找话题。",
+    "warm": "温和陪着，语气软一点，像顺毛摸。",
+    "energetic": "有劲头，像一起拉练的队友，短促有力。",
+}
+
 
 def system_prompt(training_state: str, memory: MemoryContext | None, vision: bool = False) -> str:
     address = memory.preferred_address if memory and memory.preferred_address else "你"
     style = memory.encouragement_style if memory else "warm"
-    memory_line = f"用户允许使用的偏好：称呼 {address}，鼓励风格 {style}。" if memory else "用户没有授权长期记忆，不要假装记得过去。"
+    memory_line = f"用户允许使用的偏好：称呼 {address}，鼓励风格 {style}。" if memory else "用户没有授权长期记忆，不要假装记得过去。本次对话里说过的你可以直接接话，只是别声称记得其他时间的对话。"
     vision_line = "你只看到用户主动发送的一张当前画面。只描述画面中能直接观察到的内容和机位，不推断完整动作质量。" if vision else ""
     return f"""你是动伴，一个训练时陪用户说话的伙伴。当前训练状态：{training_state}。
 {memory_line}
@@ -81,7 +140,8 @@ def system_prompt(training_state: str, memory: MemoryContext | None, vision: boo
 3. 用户说疼痛、不舒服或眩晕时，让他停止当前动作并寻求现场专业帮助，不继续鼓励硬撑。
 4. 不把摄像头、次数或心率数据包装成医学结论。心率消耗只能称为估算。
 5. 回复控制在 45 个汉字以内，使用适合直接说出口的口语短句。少用书面连接词、排比、编号和感叹号。
-6. 像熟悉的朋友自然接话，可以说“好嘞”“我在呢”“走一个”，但不要每句都喊口号，不用分数和等级评价动作。"""
+6. 像熟悉的朋友自然接话，可以说“好嘞”“我在呢”“走一个”，但不要每句都喊口号，不用分数和等级评价动作。
+7. 说话风格：{STYLE_LINES.get(style, STYLE_LINES["warm"])} 禁止“辛苦了”“恭喜你”“坚持就是胜利”这类套话。"""
 
 
 TECHNIQUE_REQUEST_WORDS = ("怎么做", "动作要领", "姿势", "技术", "教我", "该怎么", "怎么蹲", "怎么练", "哪里不对", "帮我看动作")
@@ -132,13 +192,13 @@ def prepare_speech_text(text: str) -> str:
     return spoken[:500]
 
 
-async def call_dashscope(model: str, messages: list[dict]) -> str:
+async def call_dashscope(model: str, messages: list[dict], temperature: float = 0.5) -> str:
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=8.0)) as client:
             response = await client.post(
                 CHAT_URL,
                 headers={"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "temperature": 0.5, "max_tokens": 140, "enable_thinking": False},
+                json={"model": model, "messages": messages, "temperature": temperature, "max_tokens": 140, "enable_thinking": False},
             )
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="模型响应超时，请再说一次") from exc
@@ -147,6 +207,78 @@ async def call_dashscope(model: str, messages: list[dict]) -> str:
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"模型服务请求失败（HTTP {response.status_code}）")
     return _extract_text(response.json())
+
+
+def sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def stream_chat_delta(model: str, messages: list[dict]):
+    """逐段 yield 大模型流式回复的文本增量。"""
+    payload = {"model": model, "messages": messages, "temperature": 0.5, "max_tokens": 140, "enable_thinking": False, "stream": True}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=8.0)) as client:
+            async with client.stream(
+                "POST",
+                CHAT_URL,
+                headers={"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"},
+                json=payload,
+            ) as response:
+                if response.status_code >= 400:
+                    raise HTTPException(status_code=502, detail=f"模型服务请求失败（HTTP {response.status_code}）")
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices") or [{}]
+                    piece = (choices[0].get("delta") or {}).get("content")
+                    if piece:
+                        yield piece
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="模型响应超时，请再说一次") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="暂时无法连接模型服务") from exc
+
+
+async def tts_speech_bytes(text: str) -> bytes:
+    """合成一段语音并返回完整音频字节（含重试）。"""
+    payload = {
+        "model": TTS_MODEL,
+        "input": prepare_speech_text(text),
+        "voice": TTS_VOICE,
+        "response_format": "mp3",
+        "speed": TTS_SPEED,
+        "instructions": TTS_INSTRUCTIONS,
+    }
+    last_status: int | None = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=8.0)) as client:
+                response = await client.post(
+                    TTS_URL,
+                    headers={"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+        except (httpx.TimeoutException, httpx.HTTPError):
+            if attempt == 0:
+                await asyncio.sleep(0.35)
+                continue
+            raise HTTPException(status_code=504, detail="语音生成超时，请再试一次")
+
+        last_status = response.status_code
+        if response.status_code < 400:
+            return response.content
+        if response.status_code not in (429, 500, 502, 503, 504) or attempt > 0:
+            break
+        await asyncio.sleep(0.35)
+
+    raise HTTPException(status_code=502, detail=f"语音服务请求失败（HTTP {last_status or 'unknown'}）")
 
 
 @app.get("/api/health")
@@ -161,9 +293,132 @@ def health():
 async def companion_chat(request: CompanionRequest):
     reply = await call_dashscope(TEXT_MODEL, [
         {"role": "system", "content": system_prompt(request.training_state, request.memory)},
+        *history_messages(request.session_id),
         {"role": "user", "content": request.message},
     ])
-    return CompanionResponse(reply=apply_response_policy(request.message, reply, request.memory), model=TEXT_MODEL, mode="text")
+    reply = apply_response_policy(request.message, reply, request.memory)
+    remember_turn(request.session_id, request.message, reply)
+    return CompanionResponse(reply=reply, model=TEXT_MODEL, mode="text")
+
+
+def policy_sentence(sentence: str, allow_prescription_check: bool, memory: MemoryContext | None) -> tuple[str, bool]:
+    """对单句执行回复策略。返回 (最终句子, 是否触发处方拦截)。"""
+    if allow_prescription_check and any(word in sentence for word in PRESCRIPTION_WORDS):
+        address = memory.preferred_address if memory and memory.preferred_address else ""
+        prefix = f"{address}，" if address else ""
+        return f"{prefix}我在呢。先按你舒服的节奏来，准备好就走一个。", True
+    return sentence, False
+
+
+async def _safe_tts(text: str) -> bytes | None:
+    try:
+        return await tts_speech_bytes(text)
+    except HTTPException:
+        return None
+
+
+async def chat_turn_events(request: CompanionRequest):
+    """LLM 流式 → 切句 → 每句立刻并行合成 TTS，音频按句序吐出。SSE：sentence / audio / done。"""
+    message = request.message
+    if any(word in message for word in DISCOMFORT_WORDS):
+        fixed = apply_response_policy(message, "", request.memory)
+        yield sse_event("sentence", {"text": fixed})
+        audio = await _safe_tts(fixed)
+        if audio:
+            yield sse_event("audio", {"mp3": base64.b64encode(audio).decode()})
+        else:
+            yield sse_event("tts_error", {"detail": "语音生成失败"})
+        yield sse_event("done", {"reason": "policy"})
+        return
+
+    messages = [
+        {"role": "system", "content": system_prompt(request.training_state, request.memory)},
+        *history_messages(request.session_id),
+        {"role": "user", "content": message},
+    ]
+    buffer = ""
+    full_reply = ""
+    pending: list[asyncio.Task] = []
+    blocked = False
+
+    def audio_event(task: asyncio.Task) -> str:
+        audio = task.result()
+        if audio:
+            return sse_event("audio", {"mp3": base64.b64encode(audio).decode()})
+        return sse_event("tts_error", {"detail": "语音生成失败"})
+
+    try:
+        async for delta in stream_chat_delta(TEXT_MODEL, messages):
+            buffer += delta
+            sentences, buffer = cut_sentences(buffer)
+            for sentence in sentences:
+                final, blocked = policy_sentence(sentence, not is_technique_request(message), request.memory)
+                full_reply += final
+                yield sse_event("sentence", {"text": final})
+                pending.append(asyncio.create_task(_safe_tts(final)))
+                if blocked:
+                    break
+            # 已合成完成的音频按句序先吐，没好的继续并行合成
+            while pending and pending[0].done():
+                yield audio_event(pending.pop(0))
+            if blocked:
+                break
+        tail = buffer.strip()
+        if tail and not blocked:
+            final, _ = policy_sentence(tail, not is_technique_request(message), request.memory)
+            full_reply += final
+            yield sse_event("sentence", {"text": final})
+            pending.append(asyncio.create_task(_safe_tts(final)))
+        # 流结束，按句序等齐剩余音频
+        while pending:
+            audio = await pending.pop(0)
+            if audio:
+                yield sse_event("audio", {"mp3": base64.b64encode(audio).decode()})
+            else:
+                yield sse_event("tts_error", {"detail": "语音生成失败"})
+    finally:
+        for task in pending:
+            task.cancel()
+        if full_reply:
+            remember_turn(request.session_id, message, full_reply)
+    yield sse_event("done", {})
+
+
+@app.post("/api/companion/chat/stream")
+async def companion_chat_stream(request: CompanionRequest):
+    _api_key()
+    return StreamingResponse(
+        chat_turn_events(request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+def summary_line_prompt(request: SummaryLineRequest) -> str:
+    address = request.memory.preferred_address if request.memory and request.memory.preferred_address else "你"
+    style = request.memory.encouragement_style if request.memory else "warm"
+    minutes, seconds = divmod(request.duration_seconds, 60)
+    bpm = f"{request.average_bpm} BPM" if request.average_bpm else "没有心率数据"
+    calorie = f"约 {request.calorie_kcal:.0f} kcal" if request.calorie_kcal else "没有消耗数据"
+    track = "按确认次数" if request.reward_track == "rep_count" else "按心率消耗"
+    return f"""刚陪用户练完一组深蹲，用一句不超过 30 个汉字的口语点评这次训练。称呼用户"{address}"。
+说话风格：{STYLE_LINES.get(style, STYLE_LINES["warm"])}
+禁止"辛苦了""恭喜你""坚持就是胜利"这类套话，禁止分数、等级和医学结论，不要感叹号，不要引号。
+本次数据：确认 {request.reps} 次，时长 {minutes}分{seconds}秒，平均心率 {bpm}，估算消耗 {calorie}，获得 {request.xp_earned} XP，连续训练 {request.streak_days} 天，奖励方式{track}。
+挑一两个具体数字随口提起，像朋友收摊时的那句话。直接输出这一句。"""
+
+
+@app.post("/api/companion/summary-line")
+async def companion_summary_line(request: SummaryLineRequest):
+    line = await call_dashscope(
+        TEXT_MODEL,
+        [{"role": "user", "content": summary_line_prompt(request)}],
+        temperature=0.9,
+    )
+    line = line.strip().strip("“”\"'").replace("！", "。")
+    if not line:
+        raise HTTPException(status_code=502, detail="模型没有返回文本")
+    return {"line": line[:60]}
 
 
 @app.post("/api/companion/vision", response_model=CompanionResponse)
@@ -182,43 +437,9 @@ async def companion_vision(request: VisionRequest):
 
 @app.post("/api/companion/speech")
 async def companion_speech(request: SpeechRequest):
-    payload = {
-        "model": TTS_MODEL,
-        "input": prepare_speech_text(request.text),
-        "voice": TTS_VOICE,
-        "response_format": "mp3",
-        "speed": TTS_SPEED,
-        "instructions": TTS_INSTRUCTIONS,
-    }
-    last_status: int | None = None
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=8.0)) as client:
-                response = await client.post(
-                    TTS_URL,
-                    headers={"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"},
-                    json=payload,
-                )
-        except httpx.TimeoutException as exc:
-            if attempt == 0:
-                await asyncio.sleep(0.35)
-                continue
-            raise HTTPException(status_code=504, detail="语音生成超时，请再试一次") from exc
-        except httpx.HTTPError as exc:
-            if attempt == 0:
-                await asyncio.sleep(0.35)
-                continue
-            raise HTTPException(status_code=502, detail="暂时无法连接语音服务") from exc
-
-        last_status = response.status_code
-        if response.status_code < 400:
-            return Response(
-                content=response.content,
-                media_type="audio/mpeg",
-                headers={"Cache-Control": "no-store", "X-TTS-Voice": TTS_VOICE},
-            )
-        if response.status_code not in (429, 500, 502, 503, 504) or attempt > 0:
-            break
-        await asyncio.sleep(0.35)
-
-    raise HTTPException(status_code=502, detail=f"语音服务请求失败（HTTP {last_status or 'unknown'}）")
+    content = await tts_speech_bytes(request.text)
+    return Response(
+        content=content,
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "no-store", "X-TTS-Voice": TTS_VOICE},
+    )

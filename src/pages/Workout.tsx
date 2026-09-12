@@ -6,9 +6,9 @@ import { useHeartRateMonitor } from '../hooks/useHeartRateMonitor'
 import { usePose } from '../hooks/usePose'
 import { useSquatMetrics } from '../hooks/useSquatMetrics'
 import { useWorkoutSession } from '../hooks/useWorkoutSession'
-import { useVoiceCompanion, type VoiceState } from '../hooks/useVoiceCompanion'
+import { useVoiceCompanion, type TurnResult, type VoiceState } from '../hooks/useVoiceCompanion'
 import { useStore } from '../lib/store'
-import { askCompanion, askCompanionAboutFrame } from '../services/companionApi'
+import { askCompanionAboutFrame, streamCompanionTurn } from '../services/companionApi'
 import type { VoiceCommand } from '../lib/voiceCommands'
 import type { RewardTrack, WorkoutSession } from '../types'
 
@@ -17,7 +17,7 @@ const voiceStatus: Record<VoiceState, { title: string; hint: string }> = {
   'wake-listening': { title: '动伴在线', hint: '说“你好动伴”叫我' },
   awake: { title: '我在听', hint: '直接说就好' },
   thinking: { title: '我在想', hint: '马上回答你' },
-  speaking: { title: '动伴正在说话', hint: '说完会自动继续听' },
+  speaking: { title: '动伴正在说话', hint: '开口说话就能打断我' },
   error: { title: '语音暂时中断', hint: '检查权限后点麦克风重试' },
 }
 const WAKE_REPLY = '我在呢，你说。'
@@ -47,11 +47,11 @@ export function Workout({ back, finish }: { back: () => void; finish: (session: 
     return canvas.toDataURL('image/jpeg', .68)
   }
 
-  const handleVoiceUtterance = async (command: VoiceCommand) => {
+  const handleVoiceUtterance = async (command: VoiceCommand): Promise<TurnResult> => {
     if (command.intent === 'vision') {
-      if (simulatedPose) return '现在是次数演示，没有真实摄像头画面。开始摄像头陪练后再叫我看。'
+      if (simulatedPose) return { kind: 'text', text: '现在是次数演示，没有真实摄像头画面。开始摄像头陪练后再叫我看。' }
       const image = captureCurrentFrame()
-      if (!image) return '我现在还没拿到清楚的摄像头画面，你站好后再叫我看一次。'
+      if (!image) return { kind: 'text', text: '我现在还没拿到清楚的摄像头画面，你站好后再叫我看一次。' }
       const response = await askCompanionAboutFrame(
         state,
         session?.id || 'pre-session',
@@ -59,11 +59,13 @@ export function Workout({ back, finish }: { back: () => void; finish: (session: 
         'training',
         image,
       )
-      return response.reply
+      return { kind: 'text', text: response.reply }
     }
-    if (command.wokeNow && compactSpeech(command.text).length <= 5) return WAKE_REPLY
-    const response = await askCompanion(state, session?.id || 'pre-session', command.text, 'training')
-    return response.reply
+    if (command.wokeNow && compactSpeech(command.text).length <= 5) return { kind: 'text', text: WAKE_REPLY }
+    return {
+      kind: 'stream',
+      run: (onEvent, signal) => streamCompanionTurn(state, session?.id || 'pre-session', command.text, 'training', onEvent, signal),
+    }
   }
 
   const voice = useVoiceCompanion(handleVoiceUtterance)

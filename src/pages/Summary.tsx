@@ -3,6 +3,7 @@ import { AvatarFigure } from '../components/AvatarFigure'
 import { Icon } from '../components/Icons'
 import { equipmentSeed } from '../lib/data'
 import { useStore } from '../lib/store'
+import { fetchSummaryLine, streamCompanionSpeech } from '../services/companionApi'
 import type { SavedReflection, WorkoutSession } from '../types'
 
 const fmt = (seconds: number) => `${Math.floor(seconds / 60)}:${String(Math.round(seconds % 60)).padStart(2, '0')}`
@@ -12,11 +13,44 @@ export function Summary({ result, avatar, home }: { result: WorkoutSession; avat
   const { state, saveReflection } = useStore()
   const [reward, setReward] = useState(result.unlocked.length > 0)
   const [savedFeeling, setSavedFeeling] = useState<SavedReflection['feeling'] | null>(state.memory.reflections.find(item => item.sessionId === result.id)?.feeling || null)
-  useEffect(() => { if ('speechSynthesis' in window) { const u = new SpeechSynthesisUtterance('训练完成，辛苦了'); speechSynthesis.speak(u) } }, [])
+  const [companionLine, setCompanionLine] = useState('')
+  useEffect(() => {
+    let audio: HTMLAudioElement | null = null
+    let url: string | null = null
+    void (async () => {
+      const address = state.memory.consent ? state.memory.preferredAddress : ''
+      let line = ''
+      try {
+        line = await fetchSummaryLine(state, result.id, {
+          reps: result.reps,
+          durationSeconds: result.durationSeconds,
+          averageBpm: result.averageBpm,
+          calorieKcal: result.calorieEstimate.status === 'estimated' ? result.calorieEstimate.valueKcal : null,
+          xpEarned: result.xpEarned,
+          streakDays: state.streakDays,
+          rewardTrack: result.rewardTrack,
+        })
+      } catch {
+        line = `${address ? `${address}，` : ''}${result.reps} 个深蹲一个没落，记你账上了。`
+      }
+      setCompanionLine(line)
+      try {
+        const response = await streamCompanionSpeech(line)
+        url = URL.createObjectURL(await response.blob())
+        audio = new Audio(url)
+        await audio.play()
+      } catch { /* 语音播不出来时页面文案照常 */ }
+    })()
+    return () => {
+      audio?.pause()
+      if (url) URL.revokeObjectURL(url)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   const zones = [result.zone1Seconds, result.zone2Seconds, result.zone3Seconds, result.zone4Seconds, result.zone5Seconds]
   const unlockedItem = equipmentSeed.find(item => item.id === result.unlocked[0])
   const remember = (feeling: SavedReflection['feeling']) => { if (saveReflection(result.id, feeling)) setSavedFeeling(feeling) }
-  return <div className="page summary-page"><div className="summary-hero"><span className="eyebrow">WORKOUT COMPLETE</span><h2>训练完成！</h2><p>{result.reps} 次都已经记进你的训练记录。</p><div className="summary-avatar"><AvatarFigure view="front"/></div><div className="xp-earned">+{result.xpEarned} <small>XP</small></div></div><section className="summary-sheet">
+  return <div className="page summary-page"><div className="summary-hero"><span className="eyebrow">WORKOUT COMPLETE</span><h2>训练完成！</h2><p>{result.reps} 次都已经记进你的训练记录。</p>{companionLine && <p className="companion-line">{companionLine}</p>}<div className="summary-avatar"><AvatarFigure view="front"/></div><div className="xp-earned">+{result.xpEarned} <small>XP</small></div></div><section className="summary-sheet">
     <div className="result-title"><div><small>本次确认次数</small><b>{result.reps}<em> 次</em></b></div><span>{result.rewardTrack === 'rep_count' ? '次数成长' : '心率成长'}</span></div>
     <div className="summary-grid"><div><small>训练时长</small><b>{fmt(result.durationSeconds)}</b></div><div><small>识别 / 手动</small><b>{result.detectedReps} / {result.manualAdjustment > 0 ? '+' : ''}{result.manualAdjustment}</b></div><div><small>平均心率</small><b>{result.averageBpm !== null ? `${result.averageBpm} BPM` : '无数据'}</b></div><div><small>估算消耗</small><b>{result.calorieEstimate.status === 'estimated' ? `约 ${result.calorieEstimate.valueKcal} kcal` : '无法估算'}</b></div></div>
     {result.heartRateSource === 'ble' && <div className="zone-summary">{zones.map((seconds,index)=><div key={index}><span>Zone {index+1}</span><b>{fmt(seconds)}</b></div>)}</div>}
