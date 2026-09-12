@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 
 const CHECK_INTERVAL_MS = 100
 const ABOVE_THRESHOLD_CHECKS = 3
@@ -73,5 +73,6 @@ export function useBargeInDetector(onDetected: () => void) {
 
   useEffect(() => () => stopRef.current?.(), [])
 
-  return { start, stop }
+  // 引用必须稳定：调用方把它放进 useCallback/effect 依赖，每次渲染换新对象会让对方的重置 effect 反复触发
+  return useMemo(() => ({ start, stop }), [start, stop])
 }

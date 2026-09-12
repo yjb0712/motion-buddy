@@ -123,7 +123,7 @@ export function Workout({ back, finish }: { back: () => void; finish: (session: 
     <header className="call-topbar">
       <button className="call-icon-button" onClick={leaveWorkout} aria-label="返回"><Icon name="back"/></button>
       <div className="call-identity"><b>动伴陪练</b><span><i/>{simulatedPose ? '演示计数中' : '本地计数中'}</span></div>
-      <button className={`mic-status ${voice.listening ? 'online' : ''}`} onClick={voice.voiceState === 'off' || voice.voiceState === 'error' ? voice.enable : voice.disable} aria-label={voice.voiceState === 'off' ? '打开麦克风' : '关闭麦克风'}>
+      <button type="button" className={`mic-status ${voice.listening ? 'online' : ''}`} onClick={voice.voiceState === 'off' || voice.voiceState === 'error' ? voice.enable : voice.disable} aria-label={voice.voiceState === 'off' ? '打开麦克风' : '关闭麦克风'}>
         <span>{voice.voiceState === 'off' || voice.voiceState === 'error' ? '麦克风关' : '麦克风开'}</span>
       </button>
     </header>
@@ -148,7 +148,7 @@ export function Workout({ back, finish }: { back: () => void; finish: (session: 
         <span>修正次数</span>
         <button onClick={() => adjustReps(1)} aria-label="多记一次">＋</button>
       </div>
-      <button className={`call-mic ${voice.voiceState !== 'off' && voice.voiceState !== 'error' ? 'active' : ''}`} onClick={voice.voiceState === 'off' || voice.voiceState === 'error' ? voice.enable : voice.disable} aria-label={voice.voiceState === 'off' ? '打开麦克风' : '关闭麦克风'}>🎙</button>
+      <button type="button" className={`call-mic ${voice.voiceState !== 'off' && voice.voiceState !== 'error' ? 'active' : ''}`} onClick={voice.voiceState === 'off' || voice.voiceState === 'error' ? voice.enable : voice.disable} aria-label={voice.voiceState === 'off' ? '打开麦克风' : '关闭麦克风'}>🎙</button>
       <button className="finish-call" onClick={done}><Icon name="check" size={19}/> 完成本组</button>
     </footer>
   </div>
