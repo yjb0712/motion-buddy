@@ -46,14 +46,14 @@ pnpm dev -- --port 5175
 
 ## 当前语音边界（已实测，2026-09-12 流式改造后）
 
-- 回复改为流式管线：服务端把 `qwen3.5-plus` 的流式输出按标点切句，每句立刻并行调用 TTS 合成，前端按句序无缝播放。不再等整段回复生成完才出声，本机实测首句约 3.5 秒、四句整段约 12 秒（改造前串行等全部完成要 80 秒以上）。
+- 回复改为流式管线：服务端把 `qwen-flash` 的流式输出按标点切句，每句立刻并行调用 TTS 合成，前端按句序无缝播放。不再等整段回复生成完才出声。阿里官方直连实测（2026-09-12）：对话 1.1s、问完到出第一声约 3s、TTS 单句 1.3s（对比中转站时代的 3.5s/9.4s/4.9s 全面提速）。
 - 对话保留 session 内最近 3 轮上下文，动伴能接住“我刚说啥”这类追问；跨设备的长期记忆仍需正式数据库。
 - 说话时可以打断：播放期单独开一路带回声消除的麦克风做能量检测，检测到用户开口立即停播、清空待播队列并回到聆听态。喇叭外放过大或环境嘈杂可能误触发/漏触发，阈值需真机再调。
-- 识别引擎默认走服务端代理的 DashScope Paraformer 实时识别（16kHz PCM 经 `/ws/asr` WebSocket 转发，密钥不进前端），静默 600ms 判定一句话结束；连接失败自动降级回浏览器原生识别，功能不丢只是回到旧行业水平。
+- 识别引擎默认走服务端代理的 DashScope Paraformer 实时识别（16kHz PCM 经 `/ws/asr` WebSocket 转发，密钥不进前端，需在 `.env` 设 `VITE_REALTIME_ASR=1`），静默 600ms 判定一句话结束；连接失败自动降级回浏览器原生识别，功能不丢。
 - 训练结束页的点评由模型按本次训练数据生成一句 ≤30 字的口语总结，Serena 音色播报；服务端失败时退化为本地模板句。
 - 单独说唤醒词时播放随应用发布的 `Serena` 短回应，不请求大模型或云端 TTS。
 - “先别听了”会结束当前对话并回到等待唤醒；“关闭麦克风”或界面麦克风按钮会彻底停止识别。
-- 当前渠道（openai-next 中转）的已知瓶颈：`qwen3-tts-flash` 单句合成约 4 秒、LLM 流式为伪流式（整句到达），首句延迟无法压进 3 秒内；`cosyvoice-v2` 该渠道不可用。要再提速需要换官方 DashScope 或其他低延迟 TTS 渠道，代码已按流水线组织，换渠道只需改环境变量。
+- 模型渠道已切阿里官方 DashScope（`https://dashscope.aliyuncs.com/compatible-mode/v1`）。注意官方兼容层没有 TTS（404），qwen3-tts-flash 走原生 `multimodal-generation` 端点，服务端已自动适配（wav 返回）。LLM 与 TTS 可分别配渠道（`TTS_API_BASE_URL` / `TTS_API_KEY`，不填沿用主渠道）。
 - Chrome/Edge 若阻止延迟自动播放，页面会显示“播放语音回复”按钮，由用户点一下播放。
 - 私有化备选：[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 支持语气控制、声音设计、3 秒参考音频克隆和流式生成；[CosyVoice](https://github.com/FunAudioLLM/CosyVoice) 支持情绪指令、零样本声音克隆和双向流式 TTS。两者都需要独立 GPU 服务；声音克隆必须使用获得授权的真人参考音频。参考项目：[OpenAvatarChat](https://github.com/HumanAIGC/OpenAvatarChat)（全链路数字人，需 GPU）、[TEN Framework](https://github.com/ten-framework/ten-framework)（打断与轮次管理）、[pipecat](https://github.com/pipecat-ai/pipecat)（分句流水线架构参考）。
 

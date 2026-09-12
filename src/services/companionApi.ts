@@ -4,7 +4,7 @@ export type TrainingState = 'preparing' | 'training' | 'paused' | 'finished'
 type ApiResponse = { reply: string; model: string; mode: 'text' | 'vision' }
 export type TurnEvent =
   | { type: 'sentence'; text: string }
-  | { type: 'audio'; mp3: string }
+  | { type: 'audio'; mp3: string; mime?: string }
   | { type: 'tts_error'; detail: string }
 
 const apiBase = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
@@ -125,11 +125,11 @@ export async function streamCompanionSpeech(text: string) {
   throw lastError || new Error('语音输出暂时不可用')
 }
 
-export const decodeAudioBase64 = (mp3Base64: string) => {
-  const binary = atob(mp3Base64)
+export const decodeAudioBase64 = (base64: string, mime = 'audio/mpeg') => {
+  const binary = atob(base64)
   const bytes = new Uint8Array(binary.length)
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-  return new Blob([bytes], { type: 'audio/mpeg' })
+  return new Blob([bytes], { type: mime })
 }
 
 export const companionTurn = (state: AppState, sessionId: string, message: string, trainingState: TrainingState) => ({

@@ -33,6 +33,9 @@ CHAT_URL = f"{MODEL_API_BASE_URL}/chat/completions"
 # 对话和语音可以走不同渠道（比如 LLM 用智谱官方、TTS 继续用中转）：不填 TTS_* 时沿用主渠道
 TTS_API_BASE_URL = os.getenv("TTS_API_BASE_URL", "").strip().rstrip("/") or MODEL_API_BASE_URL
 TTS_URL = f"{TTS_API_BASE_URL}/audio/speech"
+# 阿里官方的 qwen3-tts 不在 OpenAI 兼容层里，走原生 multimodal-generation 端点
+DASHSCOPE_TTS_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+IS_DASHSCOPE_TTS = "dashscope.aliyuncs.com" in TTS_API_BASE_URL or "maas.aliyuncs.com" in TTS_API_BASE_URL
 
 HISTORY_TURNS_PER_SESSION = 3
 chat_history: dict[str, deque] = {}
@@ -289,29 +292,53 @@ async def stream_chat_delta(model: str, messages: list[dict]):
 
 async def tts_speech_bytes(text: str) -> bytes:
     """合成一段语音并返回完整音频字节（含重试）。TTS 渠道的 key 独立配置，缺省沿用主渠道。"""
-    payload = {
-        "model": TTS_MODEL,
-        "input": prepare_speech_text(text),
-        "voice": TTS_VOICE,
-        "response_format": "mp3",
-        "speed": TTS_SPEED,
-        "instructions": TTS_INSTRUCTIONS,
-    }
+    spoken = prepare_speech_text(text)
+    if IS_DASHSCOPE_TTS:
+        payload = {
+            "model": TTS_MODEL,
+            "input": {"text": spoken, "voice": TTS_VOICE},
+            "parameters": {"response_format": "wav", "speed": TTS_SPEED},
+        }
+        url = DASHSCOPE_TTS_URL
+    else:
+        payload = {
+            "model": TTS_MODEL,
+            "input": spoken,
+            "voice": TTS_VOICE,
+            "response_format": "mp3",
+            "speed": TTS_SPEED,
+            "instructions": TTS_INSTRUCTIONS,
+        }
+        url = TTS_URL
     tts_key = (os.getenv("TTS_API_KEY") or "").strip() or _api_key()
     last_status: int | None = None
     for attempt in range(2):
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=8.0)) as client:
                 response = await client.post(
-                    TTS_URL,
+                    url,
                     headers={"Authorization": f"Bearer {tts_key}", "Content-Type": "application/json"},
                     json=payload,
                 )
-        except (httpx.TimeoutException, httpx.HTTPError):
+                if response.status_code < 400 and IS_DASHSCOPE_TTS:
+                    audio_url = ((response.json().get("output") or {}).get("audio") or {}).get("url")
+                    if not audio_url:
+                        raise HTTPException(status_code=502, detail="语音服务没有返回音频")
+                    downloaded = await client.get(audio_url, timeout=httpx.Timeout(30.0, connect=8.0))
+                    if downloaded.status_code < 400:
+                        return downloaded.content
+                    last_status = downloaded.status_code
+                    raise httpx.HTTPError(f"音频下载失败 HTTP {last_status}")
+        except httpx.TimeoutException:
             if attempt == 0:
                 await asyncio.sleep(0.35)
                 continue
             raise HTTPException(status_code=504, detail="语音生成超时，请再试一次")
+        except httpx.HTTPError:
+            if attempt == 0:
+                await asyncio.sleep(0.35)
+                continue
+            raise HTTPException(status_code=502, detail="暂时无法连接语音服务")
 
         last_status = response.status_code
         if response.status_code < 400:
@@ -361,13 +388,23 @@ async def _safe_tts(text: str) -> bytes | None:
 
 async def chat_turn_events(request: CompanionRequest):
     """LLM 流式 → 切句 → 每句立刻并行合成 TTS，音频按句序吐出。SSE：sentence / audio / done。"""
+    def audio_data_event(audio: bytes) -> str:
+        mime = "audio/wav" if IS_DASHSCOPE_TTS else "audio/mpeg"
+        return sse_event("audio", {"mp3": base64.b64encode(audio).decode(), "mime": mime})
+
+    def audio_event(task: asyncio.Task) -> str:
+        audio = task.result()
+        if audio:
+            return audio_data_event(audio)
+        return sse_event("tts_error", {"detail": "语音生成失败"})
+
     message = request.message
     if any(word in message for word in DISCOMFORT_WORDS):
         fixed = apply_response_policy(message, "", request.memory)
         yield sse_event("sentence", {"text": fixed})
         audio = await _safe_tts(fixed)
         if audio:
-            yield sse_event("audio", {"mp3": base64.b64encode(audio).decode()})
+            yield audio_data_event(audio)
         else:
             yield sse_event("tts_error", {"detail": "语音生成失败"})
         yield sse_event("done", {"reason": "policy"})
@@ -382,12 +419,6 @@ async def chat_turn_events(request: CompanionRequest):
     full_reply = ""
     pending: list[asyncio.Task] = []
     blocked = False
-
-    def audio_event(task: asyncio.Task) -> str:
-        audio = task.result()
-        if audio:
-            return sse_event("audio", {"mp3": base64.b64encode(audio).decode()})
-        return sse_event("tts_error", {"detail": "语音生成失败"})
 
     try:
         async for delta in stream_chat_delta(TEXT_MODEL, messages):
@@ -415,7 +446,7 @@ async def chat_turn_events(request: CompanionRequest):
         while pending:
             audio = await pending.pop(0)
             if audio:
-                yield sse_event("audio", {"mp3": base64.b64encode(audio).decode()})
+                yield audio_data_event(audio)
             else:
                 yield sse_event("tts_error", {"detail": "语音生成失败"})
     finally:
@@ -480,8 +511,9 @@ async def companion_vision(request: VisionRequest):
 @app.post("/api/companion/speech")
 async def companion_speech(request: SpeechRequest):
     content = await tts_speech_bytes(request.text)
+    media = "audio/wav" if IS_DASHSCOPE_TTS else "audio/mpeg"
     return Response(
         content=content,
-        media_type="audio/mpeg",
+        media_type=media,
         headers={"Cache-Control": "no-store", "X-TTS-Voice": TTS_VOICE},
     )

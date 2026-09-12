@@ -254,7 +254,7 @@ export function useVoiceCompanion(onUtterance: UtteranceHandler) {
       if (finished) return
       if (event.type === 'sentence') setLastReply(previous => previous + event.text)
       else if (event.type === 'audio') {
-        const url = URL.createObjectURL(decodeAudioBase64(event.mp3))
+        const url = URL.createObjectURL(decodeAudioBase64(event.mp3, event.mime))
         urls.push(url)
         const audio = new Audio(url)
         audios.push(audio)
