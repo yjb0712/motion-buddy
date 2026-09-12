@@ -389,6 +389,8 @@ export function useVoiceCompanion(onUtterance: UtteranceHandler) {
   }, [Recognition, clearRestartTimer, handleFinalText, scheduleRestart])
 
   const getRealtimeAsr = useCallback(() => {
+    // 流式识别需要 DashScope 官方密钥（中转密钥对 Paraformer 端点无效），设 VITE_REALTIME_ASR=1 显式启用
+    if (import.meta.env.VITE_REALTIME_ASR !== '1') return null
     if (realtimeBrokenRef.current) return null
     if (!realtimeRef.current) {
       realtimeRef.current = createRealtimeAsr({
@@ -417,8 +419,10 @@ export function useVoiceCompanion(onUtterance: UtteranceHandler) {
       setListening(true)
       setVoiceError(null)
       setVoiceState(awakeRef.current ? 'awake' : 'wake-listening')
+      asrRef.current = { stop: () => realtime.pause() }
       void realtime.start().catch(() => {
         realtimeBrokenRef.current = true
+        asrRef.current = null
         realtimeRef.current?.close()
         realtimeRef.current = null
         startBrowserRecognition()

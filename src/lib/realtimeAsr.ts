@@ -2,6 +2,7 @@ import { startMicCapture, type MicCapture } from './micCapture'
 
 const SAMPLE_RATE = 16000
 const SILENCE_FINAL_MS = 600
+const STARTED_TIMEOUT_MS = 6000
 
 export type RealtimeAsr = {
   /** 连接（若未连）并开始推麦克风音频。幂等。 */
@@ -18,12 +19,13 @@ export function createRealtimeAsr(callbacks: {
   onError: (detail: string) => void
 }): RealtimeAsr {
   let socket: WebSocket | null = null
+  let socketIsNew = false
+  let startedWaiter: { resolve: () => void; reject: (error: Error) => void } | null = null
   let mic: MicCapture | null = null
   let starting = false
   let closed = false
   let finalTimer: number | null = null
   let lastText = ''
-  let notifyStarted: (() => void) | null = null
 
   const wsBase = (() => {
     const envBase = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
@@ -58,7 +60,8 @@ export function createRealtimeAsr(callbacks: {
       return
     }
     if (message.type === 'started') {
-      notifyStarted?.()
+      startedWaiter?.resolve()
+      startedWaiter = null
     } else if (message.type === 'partial') {
       lastText = message.text || ''
       if (lastText) {
@@ -66,20 +69,23 @@ export function createRealtimeAsr(callbacks: {
         scheduleFinal()
       }
     } else if (message.type === 'error') {
+      startedWaiter?.reject(new Error(message.detail || '识别服务出错'))
+      startedWaiter = null
       callbacks.onError(message.detail || '识别服务出错')
     }
   }
 
-  const ensureSocket = () => new Promise<WebSocket>((resolve, reject) => {
+  const ensureSocket = () => new Promise<{ target: WebSocket; isNew: boolean }>((resolve, reject) => {
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-      resolve(socket)
+      resolve({ target: socket, isNew: false })
       return
     }
     const next = new WebSocket(`${wsBase}/ws/asr`)
     socket = next
+    socketIsNew = true
     next.onopen = () => {
       next.send(JSON.stringify({ type: 'start', sample_rate: SAMPLE_RATE }))
-      resolve(next)
+      resolve({ target: next, isNew: true })
     }
     next.onmessage = handleMessage
     next.onerror = () => {
@@ -92,16 +98,20 @@ export function createRealtimeAsr(callbacks: {
   })
 
   const waitForStarted = (target: WebSocket) => new Promise<void>((resolve, reject) => {
-    if (notifyStarted) return
     const timer = window.setTimeout(() => {
-      notifyStarted = null
+      startedWaiter = null
       reject(new Error('识别服务启动超时'))
-    }, 4000)
-    notifyStarted = () => {
-      window.clearTimeout(timer)
-      notifyStarted = null
-      if (target.readyState === WebSocket.OPEN) resolve()
-      else reject(new Error('识别服务已断开'))
+    }, STARTED_TIMEOUT_MS)
+    startedWaiter = {
+      resolve: () => {
+        window.clearTimeout(timer)
+        if (target.readyState === WebSocket.OPEN) resolve()
+        else reject(new Error('识别服务已断开'))
+      },
+      reject: (error: Error) => {
+        window.clearTimeout(timer)
+        reject(error)
+      },
     }
   })
 
@@ -110,9 +120,13 @@ export function createRealtimeAsr(callbacks: {
       if (closed || starting) return
       starting = true
       try {
-        const target = await ensureSocket()
+        const { target, isNew } = await ensureSocket()
         if (closed) return
-        await waitForStarted(target)
+        // 只有新建连接才有 run-task 握手；复用的连接不再重复等 started
+        if (isNew && socketIsNew) {
+          socketIsNew = false
+          await waitForStarted(target)
+        }
         if (closed) return
         if (!mic) {
           mic = await startMicCapture(pcm => {
