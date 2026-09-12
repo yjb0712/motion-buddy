@@ -7,9 +7,10 @@ from collections import deque
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 try:
@@ -29,7 +30,9 @@ TTS_INSTRUCTIONS = os.getenv(
 )
 MODEL_API_BASE_URL = os.getenv("MODEL_API_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/")
 CHAT_URL = f"{MODEL_API_BASE_URL}/chat/completions"
-TTS_URL = f"{MODEL_API_BASE_URL}/audio/speech"
+# 对话和语音可以走不同渠道（比如 LLM 用智谱官方、TTS 继续用中转）：不填 TTS_* 时沿用主渠道
+TTS_API_BASE_URL = os.getenv("TTS_API_BASE_URL", "").strip().rstrip("/") or MODEL_API_BASE_URL
+TTS_URL = f"{TTS_API_BASE_URL}/audio/speech"
 
 HISTORY_TURNS_PER_SESSION = 3
 chat_history: dict[str, deque] = {}
@@ -122,6 +125,17 @@ class SummaryLineRequest(BaseModel):
 
 
 app = FastAPI(title="Motion Buddy API", version="0.1.0")
+
+
+@app.exception_handler(RequestValidationError)
+async def log_validation_error(request: Request, exc: RequestValidationError):
+    """被校验拦下的请求把原始内容和原因都记进日志，避免只能看到 422 干瞪眼。"""
+    print("== 422 请求体:", str(exc.body)[:400])
+    for error in exc.errors()[:5]:
+        print("== 422 原因:", error.get("loc"), error.get("msg"))
+    return JSONResponse(status_code=422, content={"detail": [{"msg": "请求参数校验未通过，详见服务端日志"}]})
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://127.0.0.1:5175,http://localhost:5175").split(",")],
@@ -274,7 +288,7 @@ async def stream_chat_delta(model: str, messages: list[dict]):
 
 
 async def tts_speech_bytes(text: str) -> bytes:
-    """合成一段语音并返回完整音频字节（含重试）。"""
+    """合成一段语音并返回完整音频字节（含重试）。TTS 渠道的 key 独立配置，缺省沿用主渠道。"""
     payload = {
         "model": TTS_MODEL,
         "input": prepare_speech_text(text),
@@ -283,13 +297,14 @@ async def tts_speech_bytes(text: str) -> bytes:
         "speed": TTS_SPEED,
         "instructions": TTS_INSTRUCTIONS,
     }
+    tts_key = (os.getenv("TTS_API_KEY") or "").strip() or _api_key()
     last_status: int | None = None
     for attempt in range(2):
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=8.0)) as client:
                 response = await client.post(
                     TTS_URL,
-                    headers={"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"},
+                    headers={"Authorization": f"Bearer {tts_key}", "Content-Type": "application/json"},
                     json=payload,
                 )
         except (httpx.TimeoutException, httpx.HTTPError):
